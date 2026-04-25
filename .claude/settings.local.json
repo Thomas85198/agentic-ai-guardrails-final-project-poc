@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 install *)",
+      "Bash(python3 *)",
+      "Bash(rm -v chunker.py retriever.py llm_mock.py guardrails/mock_bedrock.py guardrails/real_bedrock.py .DS_Store)",
+      "Bash(rm -rfv __pycache__ guardrails/__pycache__ guardrails/nemo_config/__pycache__)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('rag_core.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(pip3 list *)",
+      "Bash(CPLUS_INCLUDE_PATH=\"/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1\" ARCHFLAGS=\"-arch arm64\" pip3 install -r requirements.txt)",
+      "Read(//private/tmp/**)",
+      "Bash(curl *)",
+      "Bash(python -m json.tool)",
+      "Bash(pkill -f \"uvicorn app:app\")",
+      "Bash(uvicorn app:app --host 0.0.0.0 --port 8000)",
+      "Bash(python -m py_compile rag_core.py pipeline.py app.py)",
+      "Bash(\"/Users/luchienlin/Desktop/1 Project/16 Agentic AI Practice/paper_rag_demo/.venv/bin/python\" --version)",
+      "Bash(.venv/bin/python rag_core.py --rebuild)",
+      "Bash(tee /tmp/rag_rebuild.log)",
+      "Bash(nohup .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000)",
+      "Bash(echo \"uvicorn PID: $!\")",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(kill 23442)"
+    ]
+  }
+}

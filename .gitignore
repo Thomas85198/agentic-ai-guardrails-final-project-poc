@@ -1,0 +1,59 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# === Virtual environments ===
+.venv/
+venv/
+env/
+ENV/
+
+# === Test / coverage ===
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === IDE / editors ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === macOS ===
+.DS_Store
+
+# === 環境變數 / 密鑰 ===
+.env
+.env.*
+!.env.example
+
+# === 專案：本地向量資料庫（Qdrant 持久化檔）===
+qdrant_storage/
+
+# === 專案：執行產物 / 評測輸出 ===
+metrics.json
+results.md
+report.md
+
+# === 專案：舊版資料 ===
+old_data/
+
+# === 專案：Log ===
+*.log
+logs/
