@@ -63,6 +63,33 @@ def _is_toc_page(text: str) -> tuple[bool, float, int]:
     return is_toc, dot_ratio, leader_count
 
 
+def load_pdf_pages(path: Path, verbose: bool = True) -> List[tuple[int, str]]:
+    """載入 PDF,跳過目錄頁,回傳 [(page_num, text), ...]。給 RAGCore 與 build_cards 共用。"""
+    reader = PdfReader(str(path))
+    pages: List[tuple[int, str]] = []
+    skipped: List[int] = []
+    for i, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        if not page_text.strip():
+            continue
+        is_toc, dot_ratio, leader = _is_toc_page(page_text)
+        if is_toc:
+            skipped.append(i)
+            if verbose:
+                print(
+                    f"[load_pdf_pages] 跳過目錄頁：{path.name} p.{i} "
+                    f"(dot_ratio={dot_ratio:.2f}, leaders={leader})"
+                )
+            continue
+        pages.append((i, page_text))
+    if verbose:
+        msg = f"[load_pdf_pages] 載入：{path.name}（{len(pages)} 頁）"
+        if skipped:
+            msg += f"，跳過目錄 {len(skipped)} 頁：{skipped}"
+        print(msg)
+    return pages
+
+
 @dataclass
 class RetrievedChunk:
     """檢索結果，給 pipeline 與 evaluator 用"""
@@ -176,33 +203,14 @@ class RAGCore:
                     )
                 )
             elif suffix == ".pdf":
-                reader = PdfReader(str(path))
-                pages_loaded = 0
-                skipped_toc: List[int] = []
-                for i, page in enumerate(reader.pages, start=1):
-                    page_text = page.extract_text() or ""
-                    if not page_text.strip():
-                        continue
-                    is_toc, dot_ratio, leader = _is_toc_page(page_text)
-                    if is_toc:
-                        skipped_toc.append(i)
-                        print(
-                            f"[RAGCore] 跳過目錄頁：{path.name} p.{i} "
-                            f"(dot_ratio={dot_ratio:.2f}, leaders={leader})"
-                        )
-                        continue
+                for page_num, page_text in load_pdf_pages(path):
                     docs.append(
                         Document(
                             text=page_text,
-                            doc_id=f"{doc_id}#p{i}",
-                            metadata={"doc_id": doc_id, "page": i},
+                            doc_id=f"{doc_id}#p{page_num}",
+                            metadata={"doc_id": doc_id, "page": page_num},
                         )
                     )
-                    pages_loaded += 1
-                msg = f"[RAGCore] 載入：{path.name}（{pages_loaded} 頁）"
-                if skipped_toc:
-                    msg += f"，跳過目錄 {len(skipped_toc)} 頁：{skipped_toc}"
-                print(msg)
 
         if not docs:
             raise FileNotFoundError(

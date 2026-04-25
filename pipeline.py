@@ -7,9 +7,14 @@ RAG Pipelines - baseline 與 guarded 兩個版本
   - GuardedRAG：INPUT 過 NeMo → query → OUTPUT 過 Presidio
 
 這樣對照才公平，guardrails 是唯一的實驗變數。
+
+Stage A 額外能力：summary 類 query 走 Paper Card 快速路徑（離線預先 build 好的論文卡），
+不再硬走 RAG 切片，徹底解決切片無法 summary 的問題。
 """
+import json
 from dataclasses import dataclass, field
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from rag_core import RAGCore, RetrievedChunk
 from guardrails import (
@@ -17,6 +22,82 @@ from guardrails import (
     NemoInputGuard,
     PresidioOutputGuard,
 )
+
+
+# === Paper Card 整合 ===
+DEFAULT_CARDS_DIR = "data/cards"
+
+# Stage A：簡單 keyword 偵測。Stage B 會換成 LLM Router。
+SUMMARY_KEYWORDS = (
+    "摘要", "簡述", "簡介", "概要", "概述", "總結",
+    "主要貢獻", "主要結果", "主要發現", "主要研究",
+    "介紹這篇", "這篇論文是什麼", "這篇論文在做什麼",
+    "summary", "summarise", "summarize", "overview",
+)
+
+
+def is_summary_query(text: str) -> bool:
+    lower = text.lower()
+    return any(kw.lower() in lower for kw in SUMMARY_KEYWORDS)
+
+
+def load_cards(cards_dir: str = DEFAULT_CARDS_DIR) -> Dict[str, dict]:
+    """讀 data/cards/*.json → {doc_id: card}。資料夾不存在或檔案壞掉時靜默略過。"""
+    p = Path(cards_dir)
+    if not p.is_dir():
+        return {}
+    out: Dict[str, dict] = {}
+    for f in sorted(p.glob("*.json")):
+        try:
+            out[f.stem] = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[pipeline] 跳過壞掉的卡片 {f.name}：{e}")
+    return out
+
+
+def card_to_markdown(card: dict) -> str:
+    """把 card dict 轉成易讀 markdown，給使用者看。"""
+    parts: List[str] = []
+    title = card.get("title")
+    if title:
+        parts.append(f"## {title}")
+    if card.get("problem"):
+        parts.append(f"**研究問題**：{card['problem']}")
+    if card.get("method"):
+        parts.append(f"**方法**：{card['method']}")
+    ds = card.get("datasets")
+    if ds:
+        ds_str = ", ".join(ds) if isinstance(ds, list) else str(ds)
+        parts.append(f"**資料集**：{ds_str}")
+    if card.get("key_findings"):
+        parts.append(f"**主要結果**：{card['key_findings']}")
+    contribs = card.get("contributions")
+    if contribs:
+        items = contribs if isinstance(contribs, list) else [contribs]
+        parts.append("**研究貢獻**：\n" + "\n".join(f"- {c}" for c in items))
+    lims = card.get("limitations")
+    if lims:
+        items = lims if isinstance(lims, list) else [lims]
+        parts.append("**限制**：\n" + "\n".join(f"- {x}" for x in items))
+    if card.get("applicable_for"):
+        parts.append(f"**適用情境**：{card['applicable_for']}")
+    return "\n\n".join(parts) if parts else "（卡片內容為空）"
+
+
+def pick_card_for_query(query: str, cards: Dict[str, dict]) -> Optional[dict]:
+    """目前單篇場景：唯一一張就直接用；多篇場景留給 Stage B 的 Router 決定。
+
+    多篇先支援一招：若 query 中明確點名某 doc_id（檔名 stem），就用該卡。
+    """
+    if not cards:
+        return None
+    if len(cards) == 1:
+        return next(iter(cards.values()))
+    lower = query.lower()
+    for doc_id, card in cards.items():
+        if doc_id.lower() in lower:
+            return card
+    return None
 
 
 @dataclass
@@ -37,8 +118,13 @@ class PipelineResult:
 class BaselineRAG:
     """純 RAG，無任何 guardrails"""
 
-    def __init__(self, rag: Optional[RAGCore] = None):
+    def __init__(
+        self,
+        rag: Optional[RAGCore] = None,
+        cards: Optional[Dict[str, dict]] = None,
+    ):
         self.rag = rag or RAGCore()
+        self.cards = cards if cards is not None else load_cards()
 
     def __call__(self, query: str) -> PipelineResult:
         answer, chunks = self.rag.query(query)
@@ -51,6 +137,17 @@ class BaselineRAG:
     def chat(self, messages: list) -> PipelineResult:
         """多輪對話版本（in-context learning）。messages 由前端維護。"""
         latest = messages[-1]["content"] if messages else ""
+
+        # Stage A: summary 類 query → 直接回 Paper Card
+        if is_summary_query(latest):
+            card = pick_card_for_query(latest, self.cards)
+            if card is not None:
+                return PipelineResult(
+                    query=latest,
+                    final_response=card_to_markdown(card),
+                    retrieved_chunks=[],
+                )
+
         answer, chunks = self.rag.chat(messages)
         return PipelineResult(
             query=latest,
@@ -67,10 +164,12 @@ class GuardedRAG:
         rag: Optional[RAGCore] = None,
         input_guard: Optional[GuardrailClient] = None,
         output_guard: Optional[GuardrailClient] = None,
+        cards: Optional[Dict[str, dict]] = None,
     ):
         self.rag = rag or RAGCore()
         self.input_guard = input_guard or NemoInputGuard()
         self.output_guard = output_guard or PresidioOutputGuard()
+        self.cards = cards if cards is not None else load_cards()
 
     def __call__(self, query: str) -> PipelineResult:
         # === Step 1: NeMo 檢查 INPUT（prompt injection / 離題）===
@@ -138,6 +237,23 @@ class GuardedRAG:
                 block_reason=str(nemo_check["assessments"]),
                 retrieved_chunks=[],
             )
+
+        # === Stage A: summary 類 query → 直接回 Paper Card（仍過 OUTPUT guard 兜底）===
+        if is_summary_query(latest):
+            card = pick_card_for_query(latest, self.cards)
+            if card is not None:
+                card_text = card_to_markdown(card)
+                out_check = self.output_guard.apply_guardrail("OUTPUT", card_text)
+                final = (
+                    out_check["output"][0]["text"]
+                    if out_check["action"] == "GUARDRAIL_INTERVENED"
+                    else card_text
+                )
+                return PipelineResult(
+                    query=latest,
+                    final_response=final,
+                    retrieved_chunks=[],
+                )
 
         # === Step 2: Presidio INPUT PII 遮罩（不擋下，遮罩後續送）===
         pii_in = self.output_guard.apply_guardrail("INPUT", latest)
