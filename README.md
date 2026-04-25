@@ -5,32 +5,47 @@
 ## 系統架構
 
 ```
-使用者查詢
-    ↓
-┌──────────────────────────────────────────────┐
-│  Input Guardrail（NVIDIA NeMo Guardrails）    │
-│  · LLM-as-judge 偵測 prompt injection         │
-│  · LLM-as-judge 偵測 denied topics（離題）    │
-└──────────────────────────────────────────────┘
-    ↓ (pass)
-┌──────────────────────────────────────────────┐
-│  RAG Core（LlamaIndex）                       │
-│  · Embedding：BGE-M3（Ollama 本地）           │
-│  · Vector DB：Qdrant（local Docker）          │
-│  · LLM：Qwen2.5:14b（Ollama 本地）            │
-└──────────────────────────────────────────────┘
-    ↓
-┌──────────────────────────────────────────────┐
-│  Output Guardrail（Microsoft Presidio）       │
-│  · spaCy zh_core_web_lg 中文 NER              │
-│  · 內建 EMAIL / PHONE 偵測                    │
-│  · 自訂台灣 PII recognizer（身分證/手機/學號）│
-└──────────────────────────────────────────────┘
-    ↓
-回傳結果
+                  使用者查詢
+                      │
+        ┌─────────────▼──────────────┐
+        │  NeMo Input Guard           │  prompt injection / 離題
+        └─────────────┬──────────────┘
+                      │ (pass)
+        ┌─────────────▼──────────────┐
+        │  Router Agent (Stage B)     │  LLM 分類為 4 個 intent
+        └──┬───────┬───────┬───────┬─┘
+           │       │       │       │
+       summary    qa    recommend  out_of_scope
+           │       │       │       │
+           ▼       ▼       ▼       ▼
+       Paper    RAG +   Recommender 拒答
+       Card    Qdrant   Agent
+      (離線)   filter  (讀全部 cards
+              by         排序+理由)
+            paper_id
+           │       │       │       │
+           └───────┴───┬───┴───────┘
+                       │
+        ┌──────────────▼─────────────┐
+        │ Presidio Output Guard       │  PII 兜底
+        └──────────────┬─────────────┘
+                       ▼
+                   回傳結果
+
+  [離線] build_cards.py → data/cards/<doc_id>.json
+         map-reduce 全文 → 結構化論文卡
 ```
 
 **所有元件都在本地執行**，無需 API key、無需網路（除首次 pull 模型）。
+
+### Agent 架構（Stage B）
+
+| Agent | 決定什麼 | 檔案 |
+|---|---|---|
+| **Router** | 從 4 個 action（summary / qa / recommend / out_of_scope）挑一個 + 哪幾篇論文 | `agents.py` |
+| **Recommender** | 跨論文研究方向問題 → 排序候選論文 + 引用 card 欄位的推薦理由 | `agents.py` |
+
+兩個 agent 都跑本地 Qwen2.5:14b，透過 JSON 輸出做結構化決策。Summary 類 query 不再走 RAG 切片，改吐預先 build 好的論文卡（解決 RAG 切片無法 summary 的本質問題）。
 
 ## Tech Stack
 
@@ -39,9 +54,10 @@
 | LLM | **Qwen2.5:14b** via Ollama | 阿里出，繁中能力最強的 14b 開源模型，M1 Max 跑起來流暢 |
 | Embedding | **BGE-M3** via Ollama | 智源出，多語 embedding SOTA，中文檢索精準 |
 | RAG framework | **LlamaIndex** | RAG 專業框架，比 LangChain 抽象更輕、預設行為更好 |
-| Vector DB | **Qdrant** (local Docker) | Rust 寫的、性能好、現在最熱門的開源向量庫 |
+| Vector DB | **Qdrant** (local Docker) | Rust 寫的、性能好、metadata filter 強（多論文場景能用 `paper_id` 隔離） |
 | Input Guard | **NVIDIA NeMo Guardrails** | 業界主流，用 Colang DSL + LLM-as-judge，不靠 regex |
 | Output Guard | **Microsoft Presidio** | PII 偵測業界標準，內建多語 NER + 可擴充 recognizer |
+| Agent layer | **Router + Recommender** (自寫於 `agents.py`) | 用本地 LLM JSON-mode 做結構化決策；Stage B 把固定 if/else 升級成 agent-driven dispatch |
 
 ## 安裝
 
@@ -105,6 +121,16 @@ python3 -m guardrails.nemo_input          # input rails 示範
 python3 pipeline.py                       # baseline vs guarded
 ```
 
+### 2.5 為新論文 build 論文卡（Stage A 必要、Stage B Recommender 仰賴）
+
+```bash
+python3 build_cards.py                    # 為 data/*.pdf 全部產卡（已存在會跳過）
+python3 build_cards.py --force            # 強制重建所有卡
+```
+
+長論文走 map-reduce（每段抽事實線索 → 合併為最終 card），輸出落到 `data/cards/<doc_id>.json`。
+Router 命中 `summary` 或 `recommend` intent 時會直接讀這些卡，不走 RAG 切片。
+
 ### 3. 互動式 / 對話式 demo
 
 ```bash
@@ -119,17 +145,23 @@ python3 demo_synthetic_pii.py       # 合成 PII corpus 的最壞場景 demo
 ```
 paper_rag_demo/
 ├── README.md
+├── report.md                      ← 完整報告（給老師）
 ├── requirements.txt
 ├── data/                          ← 放論文，支援 .txt / .md / .pdf
-│   └── paper.pdf                  ← 待索引的論文（可放任何 PDF/TXT/MD）
-├── rag_core.py                    ← LlamaIndex + Qdrant + Ollama 整合
-├── pipeline.py                    ← BaselineRAG / GuardedRAG
+│   ├── paper.pdf                  ← 待索引的論文
+│   └── cards/                     ← 離線 build 的論文卡（JSON）
+├── rag_core.py                    ← LlamaIndex + Qdrant + Ollama 整合（含 TOC 過濾、metadata filter）
+├── pipeline.py                    ← BaselineRAG / GuardedRAG（Stage B：Router 分流）
+├── agents.py                      ← Router + Recommender agents
+├── build_cards.py                 ← 離線論文卡產生器（map-reduce）
 ├── test_cases.py                  ← 5 類 × 4 筆測試查詢
 ├── run_eval.py                    ← 主 runner，產出 results.md / metrics.json
 ├── compare.py                     ← 互動式對照工具
 ├── demo_chat.py                   ← 6 個精選 query 對話式 demo
 ├── synthetic_corpus.py            ← 合成 PII fixture（最壞場景）
 ├── demo_synthetic_pii.py          ← 最壞場景演示
+├── app.py                         ← FastAPI 後端（/api/chat、Swagger UI）
+├── static/index.html              ← ChatGPT 風格對話前端
 └── guardrails/
     ├── __init__.py
     ├── interface.py               ← GuardrailClient ABC
@@ -171,24 +203,29 @@ paper_rag_demo/
 3. **Presidio 中文 NER**：`zh_core_web_lg` 對人名/地名能辨識，但對「中文姓名 + 職稱」這種組合
    召回率有限。台灣場景已用自訂 PatternRecognizer 補強身分證/手機/學號。
 
-4. **單篇論文 corpus**：目前只索引一篇。多篇論文時，需考慮 metadata filter
-   （`vector_store.add()` 加 `doc_id`）以區分來源。
+4. **多論文 corpus 尚未實測**：infrastructure 已就緒（`paper_id` metadata filter、Router、Recommender 全部支援多論文），但 `data/` 目前只有一篇 PDF；正式跨論文 demo 需先補論文 + 跑 `build_cards.py` + `--rebuild` 索引。
+
+5. **Router 也是 LLM 判斷**：與 NeMo 同樣有「自己審自己」的盲點；Critic agent（反幻覺檢查）尚未實作，這是 Stage C 的工作。
 
 ## 進一步擴充方向
 
 - [ ] Latency / cost 量測欄位加進 `PipelineResult`（雙閘 guardrails 開銷量化）
 - [ ] Ablation study：拿掉單一 guardrail 看洩漏率/誤擋率變化
-- [ ] 改成 Agentic：讓 retrieval 失敗時 agent 自主換 query 或換策略
+- [ ] **Stage C：Critic agent**（反幻覺）— 對 qa / recommend 回應做事後逐句檢驗
+- [ ] **Stage C：Per-paper Retriever agent**（跨論文平行檢索）— 推薦時對每篇候選論文獨立做 RAG，把實證 chunks 餵給 Recommender
 - [ ] Citation-aware：每句後標 chunk_id，方便驗證 grounding
 - [ ] RAGAS 評估：faithfulness / answer relevance / context precision
 
 ## 從原 mock prototype 升級的對照
 
-| 項目 | v1 prototype | v2（現在） |
-|---|---|---|
-| LLM | 規則式 mock | Qwen2.5:14b（real Ollama） |
-| Chunking | 自寫章節切分 | LlamaIndex SentenceSplitter |
-| Retriever | BM25 + jieba | BGE-M3 + Qdrant 向量檢索 |
-| Input Guard | 自寫 regex | NeMo Guardrails (LLM-as-judge) |
-| Output Guard | 自寫 regex | Presidio + spaCy zh NER |
-| Vector DB | 無（記憶體 BM25） | Qdrant（持久化） |
+| 項目 | v1 prototype | v2（雙閘 guardrails） | v3（agentic，現在） |
+|---|---|---|---|
+| LLM | 規則式 mock | Qwen2.5:14b（real Ollama） | 同 v2 |
+| Chunking | 自寫章節切分 | LlamaIndex SentenceSplitter | + TOC 頁過濾 |
+| Retriever | BM25 + jieba | BGE-M3 + Qdrant 向量檢索 | + `paper_id` metadata filter |
+| Input Guard | 自寫 regex | NeMo Guardrails (LLM-as-judge) | 同 v2 |
+| Output Guard | 自寫 regex | Presidio + spaCy zh NER | 同 v2 |
+| Vector DB | 無（記憶體 BM25） | Qdrant（持久化） | 同 v2 |
+| Query 分流 | — | 寫死的 if/else | **Router agent**（LLM 分 4 intent） |
+| Summary | RAG 切片硬湊（不 work） | 同 v1 | **Paper Card** map-reduce 全文摘要 |
+| 跨論文推薦 | — | — | **Recommender agent**（讀 cards 排序） |

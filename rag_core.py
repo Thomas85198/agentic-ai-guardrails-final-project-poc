@@ -30,6 +30,12 @@ from llama_index.core import (
 from llama_index.core.llms import ChatMessage
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import NodeWithScore
+from llama_index.core.vector_stores import (
+    FilterCondition,
+    FilterOperator,
+    MetadataFilter,
+    MetadataFilters,
+)
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -189,6 +195,9 @@ class RAGCore:
             if suffix not in SUPPORTED_EXTS:
                 continue
             doc_id = path.stem
+            # 注意：metadata key 用 "paper_id" 而不是 "doc_id"，
+            # 因為 LlamaIndex 會把 Document 的 ref_doc_id 寫進 Qdrant 的 top-level "doc_id"
+            # payload，會蓋掉我們 metadata 的同名 key，導致 filter 失效。
             if suffix in {".txt", ".md"}:
                 text = path.read_text(encoding="utf-8")
                 if not text.strip():
@@ -199,7 +208,7 @@ class RAGCore:
                     Document(
                         text=text,
                         doc_id=doc_id,
-                        metadata={"doc_id": doc_id},
+                        metadata={"paper_id": doc_id},
                     )
                 )
             elif suffix == ".pdf":
@@ -208,7 +217,7 @@ class RAGCore:
                         Document(
                             text=page_text,
                             doc_id=f"{doc_id}#p{page_num}",
-                            metadata={"doc_id": doc_id, "page": page_num},
+                            metadata={"paper_id": doc_id, "page": page_num},
                         )
                     )
 
@@ -220,13 +229,13 @@ class RAGCore:
 
     @staticmethod
     def _node_to_chunk(n: NodeWithScore) -> RetrievedChunk:
-        """把 LlamaIndex NodeWithScore 抽成 RetrievedChunk，連帶帶出 doc_id/page metadata。"""
+        """把 LlamaIndex NodeWithScore 抽成 RetrievedChunk，連帶帶出 paper_id/page metadata。"""
         meta = n.node.metadata or {}
         return RetrievedChunk(
             chunk_id=n.node.node_id[:12],
             text=n.node.get_content(),
             score=float(n.score or 0.0),
-            doc_id=meta.get("doc_id", ""),
+            doc_id=meta.get("paper_id", ""),
             page=meta.get("page"),
         )
 
@@ -235,6 +244,41 @@ class RAGCore:
         nodes: List[NodeWithScore] = self.retriever.retrieve(query)
         return [self._node_to_chunk(n) for n in nodes]
 
+    # === Stage B：依 doc_id 過濾的檢索 ===
+    def retrieve_filtered(
+        self,
+        query: str,
+        paper_ids: Optional[List[str]] = None,
+        top_k: Optional[int] = None,
+    ) -> List[RetrievedChunk]:
+        """限定 doc_id 範圍做檢索。paper_ids=None / [] 等於不過濾,跑全索引。"""
+        k = top_k or self.top_k
+        if not paper_ids:
+            return self.retrieve(query)
+        # 注意：filter key 是 "paper_id"，配合 _load_documents 寫入 metadata 的 key。
+        filters = MetadataFilters(
+            filters=[
+                MetadataFilter(key="paper_id", value=pid, operator=FilterOperator.EQ)
+                for pid in paper_ids
+            ],
+            condition=FilterCondition.OR,
+        )
+        retriever = self.index.as_retriever(similarity_top_k=k, filters=filters)
+        nodes: List[NodeWithScore] = retriever.retrieve(query)
+        return [self._node_to_chunk(n) for n in nodes]
+
+    def retrieve_per_paper(
+        self,
+        query: str,
+        paper_ids: List[str],
+        top_k_per_paper: int = 3,
+    ) -> dict:
+        """每篇論文獨立檢索 top_k,避免單篇高分 chunk 把其他篇擠掉。回 {doc_id: [chunks]}。"""
+        return {
+            pid: self.retrieve_filtered(query, paper_ids=[pid], top_k=top_k_per_paper)
+            for pid in paper_ids
+        }
+
     # === 給 pipeline 用：完整 RAG（檢索 + LLM 生成）===
     def query(self, query: str) -> tuple[str, List[RetrievedChunk]]:
         response = self.query_engine.query(query)
@@ -242,12 +286,18 @@ class RAGCore:
         return str(response), chunks
 
     # === 給 chat API 用：多輪對話 with in-context learning ===
-    def chat(self, messages: List[dict]) -> tuple[str, List[RetrievedChunk]]:
+    def chat(
+        self,
+        messages: List[dict],
+        paper_ids: Optional[List[str]] = None,
+    ) -> tuple[str, List[RetrievedChunk]]:
         """
         多輪對話：把對話歷史與 retrieved context 一起餵給 LLM。
 
         messages 格式：[{"role": "user"|"assistant", "content": "..."}, ...]
         最後一筆必須是 user。
+
+        Stage B：可傳 paper_ids 把檢索範圍限定在指定論文 (給 Router 分流後使用)。
 
         設計：
           - retrieval 只用最新 user query（避免雜訊）
@@ -258,7 +308,7 @@ class RAGCore:
             raise ValueError("messages 不能為空，且最後一筆必須是 user")
 
         latest_query = messages[-1]["content"]
-        chunks = self.retrieve(latest_query)
+        chunks = self.retrieve_filtered(latest_query, paper_ids=paper_ids)
 
         def _src_label(c: RetrievedChunk) -> str:
             """組成人類/模型都看得懂的來源標籤,例如 'paper, p.3' 或 'paper'。"""

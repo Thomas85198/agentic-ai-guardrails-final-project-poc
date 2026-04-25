@@ -8,8 +8,10 @@ RAG Pipelines - baseline 與 guarded 兩個版本
 
 這樣對照才公平，guardrails 是唯一的實驗變數。
 
-Stage A 額外能力：summary 類 query 走 Paper Card 快速路徑（離線預先 build 好的論文卡），
-不再硬走 RAG 切片，徹底解決切片無法 summary 的問題。
+Stage A：summary 類 query 走 Paper Card 快速路徑（離線預先 build 好的論文卡），
+        不再硬走 RAG 切片，徹底解決切片無法 summary 的問題。
+Stage B：Router agent 把 user query 分到 4 個 intent (summary / qa / recommend / out_of_scope),
+        取代原本的 keyword hack。Recommender agent 處理跨論文推薦。
 """
 import json
 from dataclasses import dataclass, field
@@ -22,23 +24,18 @@ from guardrails import (
     NemoInputGuard,
     PresidioOutputGuard,
 )
+from agents import Recommender, Router, RouterDecision
 
 
 # === Paper Card 整合 ===
 DEFAULT_CARDS_DIR = "data/cards"
 
-# Stage A：簡單 keyword 偵測。Stage B 會換成 LLM Router。
-SUMMARY_KEYWORDS = (
-    "摘要", "簡述", "簡介", "概要", "概述", "總結",
-    "主要貢獻", "主要結果", "主要發現", "主要研究",
-    "介紹這篇", "這篇論文是什麼", "這篇論文在做什麼",
-    "summary", "summarise", "summarize", "overview",
+# Router 判 out_of_scope 時的回覆
+OUT_OF_SCOPE_REPLY = (
+    "這個問題超出本系統的論文檢索範圍。"
+    "本系統專注於協助你查詢、摘要、比較目前已索引的論文。"
+    "你可以試試：詢問某篇論文的概要、實驗細節，或描述你的研究方向尋求推薦。"
 )
-
-
-def is_summary_query(text: str) -> bool:
-    lower = text.lower()
-    return any(kw.lower() in lower for kw in SUMMARY_KEYWORDS)
 
 
 def load_cards(cards_dir: str = DEFAULT_CARDS_DIR) -> Dict[str, dict]:
@@ -84,19 +81,14 @@ def card_to_markdown(card: dict) -> str:
     return "\n\n".join(parts) if parts else "（卡片內容為空）"
 
 
-def pick_card_for_query(query: str, cards: Dict[str, dict]) -> Optional[dict]:
-    """目前單篇場景：唯一一張就直接用；多篇場景留給 Stage B 的 Router 決定。
-
-    多篇先支援一招：若 query 中明確點名某 doc_id（檔名 stem），就用該卡。
-    """
-    if not cards:
-        return None
+def _resolve_summary_card(
+    decision: RouterDecision, cards: Dict[str, dict]
+) -> Optional[dict]:
+    """summary intent 應該指名一篇。Router 沒指名時:單篇就用唯一一篇,多篇放棄。"""
+    if decision.paper_ids:
+        return cards.get(decision.paper_ids[0])
     if len(cards) == 1:
         return next(iter(cards.values()))
-    lower = query.lower()
-    for doc_id, card in cards.items():
-        if doc_id.lower() in lower:
-            return card
     return None
 
 
@@ -116,15 +108,19 @@ class PipelineResult:
 
 
 class BaselineRAG:
-    """純 RAG，無任何 guardrails"""
+    """純 RAG，無任何 guardrails（Stage B：仍走 Router agent 分流）"""
 
     def __init__(
         self,
         rag: Optional[RAGCore] = None,
         cards: Optional[Dict[str, dict]] = None,
+        router: Optional[Router] = None,
+        recommender: Optional[Recommender] = None,
     ):
         self.rag = rag or RAGCore()
         self.cards = cards if cards is not None else load_cards()
+        self.router = router or Router()
+        self.recommender = recommender or Recommender()
 
     def __call__(self, query: str) -> PipelineResult:
         answer, chunks = self.rag.query(query)
@@ -135,20 +131,46 @@ class BaselineRAG:
         )
 
     def chat(self, messages: list) -> PipelineResult:
-        """多輪對話版本（in-context learning）。messages 由前端維護。"""
-        latest = messages[-1]["content"] if messages else ""
+        """多輪對話版本（in-context learning）。messages 由前端維護。
 
-        # Stage A: summary 類 query → 直接回 Paper Card
-        if is_summary_query(latest):
-            card = pick_card_for_query(latest, self.cards)
+        Stage B 流程：
+          Router → {summary | qa | recommend | out_of_scope} → 對應 handler
+        """
+        latest = messages[-1]["content"] if messages else ""
+        decision = self.router.decide(latest, self.cards)
+        print(f"[BaselineRAG] router → {decision.intent} {decision.paper_ids} ({decision.reasoning})")
+
+        if decision.intent == "out_of_scope":
+            return PipelineResult(
+                query=latest,
+                final_response=OUT_OF_SCOPE_REPLY,
+                retrieved_chunks=[],
+            )
+
+        if decision.intent == "summary":
+            card = _resolve_summary_card(decision, self.cards)
             if card is not None:
                 return PipelineResult(
                     query=latest,
                     final_response=card_to_markdown(card),
                     retrieved_chunks=[],
                 )
+            # 卡片找不到就 fallback 到 qa
 
-        answer, chunks = self.rag.chat(messages)
+        if decision.intent == "recommend":
+            scope = (
+                {pid: self.cards[pid] for pid in decision.paper_ids if pid in self.cards}
+                or self.cards
+            )
+            reply = self.recommender.recommend(latest, scope)
+            return PipelineResult(
+                query=latest,
+                final_response=reply,
+                retrieved_chunks=[],
+            )
+
+        # qa（含 summary fallback）
+        answer, chunks = self.rag.chat(messages, paper_ids=decision.paper_ids or None)
         return PipelineResult(
             query=latest,
             final_response=answer,
@@ -165,11 +187,15 @@ class GuardedRAG:
         input_guard: Optional[GuardrailClient] = None,
         output_guard: Optional[GuardrailClient] = None,
         cards: Optional[Dict[str, dict]] = None,
+        router: Optional[Router] = None,
+        recommender: Optional[Recommender] = None,
     ):
         self.rag = rag or RAGCore()
         self.input_guard = input_guard or NemoInputGuard()
         self.output_guard = output_guard or PresidioOutputGuard()
         self.cards = cards if cards is not None else load_cards()
+        self.router = router or Router()
+        self.recommender = recommender or Recommender()
 
     def __call__(self, query: str) -> PipelineResult:
         # === Step 1: NeMo 檢查 INPUT（prompt injection / 離題）===
@@ -214,20 +240,20 @@ class GuardedRAG:
         )
 
     def chat(self, messages: list) -> PipelineResult:
-        """多輪對話版本：INPUT guard 看最新 query，OUTPUT guard 看 LLM 回應。
+        """多輪對話版本：NeMo + Router agent + Presidio 三層串接。
 
-        v2 雙向 PII 防禦：
-          1. NeMo INPUT  → 擋 prompt injection / 離題
-          2. Presidio INPUT → 遮罩 PII（**遮罩後的 query 才送 RAG**）
-          3. RAG（看不到原始 PII）
-          4. Presidio OUTPUT → 兜底，防 LLM 從 chunks 撈出 PII
+        Stage B 流程：
+          1. NeMo INPUT       → 擋 prompt injection / 離題
+          2. Router agent     → 分到 summary / qa / recommend / out_of_scope
+          3. 各 intent 的 handler 跑（qa 還會過 Presidio INPUT 遮罩 + OUTPUT 兜底）
+          4. Presidio OUTPUT  → 所有 handler 的回應都過一遍兜底
 
         注意：NeMo 只看 messages[-1]，無法偵測 multi-turn jailbreak
         （見 report.md 第 8 節限制 8）。
         """
         latest = messages[-1]["content"] if messages else ""
 
-        # === Step 1: NeMo INPUT（prompt injection / 離題）===
+        # === Step 1: NeMo INPUT ===
         nemo_check = self.input_guard.apply_guardrail("INPUT", latest)
         if nemo_check["action"] == "GUARDRAIL_INTERVENED":
             return PipelineResult(
@@ -238,38 +264,39 @@ class GuardedRAG:
                 retrieved_chunks=[],
             )
 
-        # === Stage A: summary 類 query → 直接回 Paper Card（仍過 OUTPUT guard 兜底）===
-        if is_summary_query(latest):
-            card = pick_card_for_query(latest, self.cards)
+        # === Step 2: Router agent ===
+        decision = self.router.decide(latest, self.cards)
+        print(f"[GuardedRAG] router → {decision.intent} {decision.paper_ids} ({decision.reasoning})")
+
+        # === Step 3: 各 intent 處理 ===
+        chunks: List[RetrievedChunk] = []
+
+        if decision.intent == "out_of_scope":
+            return PipelineResult(
+                query=latest,
+                final_response=OUT_OF_SCOPE_REPLY,
+                retrieved_chunks=[],
+            )
+
+        elif decision.intent == "summary":
+            card = _resolve_summary_card(decision, self.cards)
             if card is not None:
-                card_text = card_to_markdown(card)
-                out_check = self.output_guard.apply_guardrail("OUTPUT", card_text)
-                final = (
-                    out_check["output"][0]["text"]
-                    if out_check["action"] == "GUARDRAIL_INTERVENED"
-                    else card_text
-                )
-                return PipelineResult(
-                    query=latest,
-                    final_response=final,
-                    retrieved_chunks=[],
-                )
+                raw_answer = card_to_markdown(card)
+            else:
+                # 找不到對應卡片 → fallback 到 qa
+                raw_answer, chunks = self._guarded_qa(messages, decision.paper_ids)
 
-        # === Step 2: Presidio INPUT PII 遮罩（不擋下，遮罩後續送）===
-        pii_in = self.output_guard.apply_guardrail("INPUT", latest)
-        if pii_in["action"] == "GUARDRAIL_INTERVENED":
-            redacted_latest = pii_in["output"][0]["text"]
-            # 用遮罩版的最新 user message 重組 messages，前面歷史保留原樣
-            messages_for_llm = messages[:-1] + [
-                {"role": "user", "content": redacted_latest}
-            ]
-        else:
-            messages_for_llm = messages
+        elif decision.intent == "recommend":
+            scope = (
+                {pid: self.cards[pid] for pid in decision.paper_ids if pid in self.cards}
+                or self.cards
+            )
+            raw_answer = self.recommender.recommend(latest, scope)
 
-        # === Step 3: RAG（用遮罩版送進 LLM 與 retrieval）===
-        raw_answer, chunks = self.rag.chat(messages_for_llm)
+        else:  # qa
+            raw_answer, chunks = self._guarded_qa(messages, decision.paper_ids)
 
-        # === Step 4: Presidio OUTPUT（兜底）===
+        # === Step 4: Presidio OUTPUT 兜底（所有路徑都過）===
         out_check = self.output_guard.apply_guardrail("OUTPUT", raw_answer)
         if out_check["action"] == "GUARDRAIL_INTERVENED":
             return PipelineResult(
@@ -285,6 +312,24 @@ class GuardedRAG:
             final_response=raw_answer,
             retrieved_chunks=chunks,
         )
+
+    def _guarded_qa(
+        self, messages: list, paper_ids: List[str]
+    ) -> tuple[str, List[RetrievedChunk]]:
+        """qa 路徑：Presidio INPUT 遮罩 → RAG (filter by paper_ids) → 回答。
+        OUTPUT guard 由 chat() 統一處理。
+        """
+        latest = messages[-1]["content"] if messages else ""
+        pii_in = self.output_guard.apply_guardrail("INPUT", latest)
+        if pii_in["action"] == "GUARDRAIL_INTERVENED":
+            redacted_latest = pii_in["output"][0]["text"]
+            messages_for_llm = messages[:-1] + [
+                {"role": "user", "content": redacted_latest}
+            ]
+        else:
+            messages_for_llm = messages
+
+        return self.rag.chat(messages_for_llm, paper_ids=paper_ids or None)
 
 
 if __name__ == "__main__":
