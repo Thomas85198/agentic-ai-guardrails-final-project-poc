@@ -451,6 +451,59 @@
     font-size: 11px;
     margin-top: 6px;
   }
+
+  /* Confirm modal (mode switch) */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    max-width: 360px;
+    width: calc(100% - 40px);
+    box-shadow: var(--shadow-lg);
+  }
+  .modal h3 {
+    margin: 0 0 8px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .modal p {
+    margin: 0 0 16px;
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .modal-btn {
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  .modal-btn.confirm {
+    background: var(--danger);
+    color: white;
+    border-color: var(--danger);
+  }
 </style>
 </head>
 <body>
@@ -496,6 +549,17 @@
 
 <div class="cite-popover" id="citePopover" role="tooltip"></div>
 
+<div class="modal-backdrop" id="modeSwitchModal" hidden>
+  <div class="modal" role="dialog" aria-labelledby="modeSwitchTitle" aria-modal="true">
+    <h3 id="modeSwitchTitle">切換模式</h3>
+    <p>切換模式會清空目前的對話內容,確定要繼續嗎?</p>
+    <div class="modal-actions">
+      <button class="modal-btn" id="modalCancelBtn" type="button">取消</button>
+      <button class="modal-btn confirm" id="modalConfirmBtn" type="button">確定切換</button>
+    </div>
+  </div>
+</div>
+
 <script>
   // === State ===
   // messages 同時供 UI 渲染與送回後端使用，但形狀稍有不同：
@@ -535,12 +599,51 @@
   });
 
   // === Mode toggle ===
+  // 切換模式時，若已經有對話內容就先彈窗確認（切換會清空 messages）。
+  const modeSwitchModal = document.getElementById("modeSwitchModal");
+  const modalCancelBtn = document.getElementById("modalCancelBtn");
+  const modalConfirmBtn = document.getElementById("modalConfirmBtn");
+  let pendingMode = null;
+
+  function applyMode(newMode) {
+    modeToggle.querySelectorAll("button").forEach(b => {
+      b.classList.toggle("active", b.dataset.mode === newMode);
+    });
+    mode = newMode;
+  }
+
   modeToggle.querySelectorAll("button").forEach(btn => {
     btn.addEventListener("click", () => {
-      modeToggle.querySelectorAll("button").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      mode = btn.dataset.mode;
+      const newMode = btn.dataset.mode;
+      if (newMode === mode) return;
+      if (messages.length === 0) {
+        applyMode(newMode);
+        return;
+      }
+      pendingMode = newMode;
+      modeSwitchModal.hidden = false;
     });
+  });
+
+  function closeModeSwitchModal() {
+    pendingMode = null;
+    modeSwitchModal.hidden = true;
+  }
+  modalCancelBtn.addEventListener("click", closeModeSwitchModal);
+  modeSwitchModal.addEventListener("click", (e) => {
+    if (e.target === modeSwitchModal) closeModeSwitchModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modeSwitchModal.hidden) closeModeSwitchModal();
+  });
+  modalConfirmBtn.addEventListener("click", () => {
+    if (pendingMode) {
+      messages = [];
+      applyMode(pendingMode);
+      renderAll();
+    }
+    pendingMode = null;
+    modeSwitchModal.hidden = true;
   });
 
   // === Clear ===

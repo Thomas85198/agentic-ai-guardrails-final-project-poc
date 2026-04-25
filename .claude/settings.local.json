@@ -20,7 +20,12 @@
       "Bash(nohup .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000)",
       "Bash(echo \"uvicorn PID: $!\")",
       "Bash(.venv/bin/python -c ' *)",
-      "Bash(kill 23442)"
+      "Bash(kill 23442)",
+      "Bash(open -a Ollama)",
+      "Bash(docker run *)",
+      "Bash(lsof -i :8000)",
+      "Bash(ls -d .venv)",
+      "Bash(xargs -r kill)"
     ]
   }
 }

@@ -16,6 +16,7 @@ RAG Core - LlamaIndex + Qdrant + Ollama 的整合層
   - 程式內：RAGCore(force_rebuild=True)
   - 命令列：python rag_core.py --rebuild
 """
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -44,6 +45,23 @@ DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_DATA_DIR = "data"
 SUPPORTED_EXTS = {".txt", ".md", ".pdf"}
 
+# TOC 偵測門檻：dot ratio 來自「去空白後 . 的占比」，目錄頁通常 > 30%
+_TOC_DOT_RATIO = 0.15
+# leader-dots 出現次數（5 個以上連續點，或被空白隔開的 . . . . . 也算）
+_TOC_LEADER_DOTS_MIN = 5
+_LEADER_DOTS_RE = re.compile(r"(?:\.\s*){5,}")
+
+
+def _is_toc_page(text: str) -> tuple[bool, float, int]:
+    """偵測 PDF 頁是否為目錄/圖目錄/表目錄。回傳 (是否跳過, dot_ratio, leader 次數)。"""
+    non_ws = "".join(text.split())
+    if len(non_ws) < 50:
+        return False, 0.0, 0
+    dot_ratio = non_ws.count(".") / len(non_ws)
+    leader_count = len(_LEADER_DOTS_RE.findall(text))
+    is_toc = dot_ratio > _TOC_DOT_RATIO or leader_count >= _TOC_LEADER_DOTS_MIN
+    return is_toc, dot_ratio, leader_count
+
 
 @dataclass
 class RetrievedChunk:
@@ -65,7 +83,7 @@ class RAGCore:
         llm_model: str = DEFAULT_LLM_MODEL,
         embed_model: str = DEFAULT_EMBED_MODEL,
         qdrant_url: str = DEFAULT_QDRANT_URL,
-        top_k: int = 3,
+        top_k: int = 5,
         force_rebuild: bool = False,
         documents: Optional[List[Document]] = None,
     ):
@@ -160,9 +178,18 @@ class RAGCore:
             elif suffix == ".pdf":
                 reader = PdfReader(str(path))
                 pages_loaded = 0
+                skipped_toc: List[int] = []
                 for i, page in enumerate(reader.pages, start=1):
                     page_text = page.extract_text() or ""
                     if not page_text.strip():
+                        continue
+                    is_toc, dot_ratio, leader = _is_toc_page(page_text)
+                    if is_toc:
+                        skipped_toc.append(i)
+                        print(
+                            f"[RAGCore] 跳過目錄頁：{path.name} p.{i} "
+                            f"(dot_ratio={dot_ratio:.2f}, leaders={leader})"
+                        )
                         continue
                     docs.append(
                         Document(
@@ -172,7 +199,10 @@ class RAGCore:
                         )
                     )
                     pages_loaded += 1
-                print(f"[RAGCore] 載入：{path.name}（{pages_loaded} 頁）")
+                msg = f"[RAGCore] 載入：{path.name}（{pages_loaded} 頁）"
+                if skipped_toc:
+                    msg += f"，跳過目錄 {len(skipped_toc)} 頁：{skipped_toc}"
+                print(msg)
 
         if not docs:
             raise FileNotFoundError(
